@@ -1,1 +1,0 @@
-The doc files have been moved to lpg.generator/docs

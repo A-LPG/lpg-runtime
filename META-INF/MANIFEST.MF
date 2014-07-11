@@ -1,8 +1,7 @@
 Manifest-Version: 1.0
 Bundle-ManifestVersion: 2
-Bundle-Name: LPG Java Runtime
+Bundle-Name: lpg.runtime
 Bundle-SymbolicName: lpg.runtime
-Bundle-ClassPath: lpgruntime.jar
 Bundle-Version: 2.0.17.qualifier
-Bundle-Localization: plugin
 Export-Package: lpg.runtime
+Bundle-RequiredExecutionEnvironment: JavaSE-1.7

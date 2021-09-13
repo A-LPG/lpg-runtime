@@ -215,7 +215,7 @@ public class PrsStream implements IPrsStream, ParseErrorCodes
 
     public int getLineNumberOfCharAt(int i) { return iLexStream.getLineNumberOfCharAt(i); }
 
-    public int getColumnOfCharAt(int i) { return getColumnOfCharAt(i); }
+    public int getColumnOfCharAt(int i) { return iLexStream.getColumnOfCharAt(i); }
     
     /**
      * @deprecated replaced by {@link #getFirstRealToken()}

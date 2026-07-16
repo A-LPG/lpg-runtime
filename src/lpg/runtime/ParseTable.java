@@ -99,4 +99,12 @@ public interface ParseTable
     public boolean isValidForParser();
 
     public boolean getBacktrack();
+
+    //
+    // Map a nonterminal token kind (a symbol value with NT_OFFSET already
+    // applied) to a compact index into the RuleAction.getProstheticAst() array.
+    // Tables generated for grammars without %Recover symbols use this default,
+    // which selects the null-factory slot.
+    //
+    default int getProsthesisIndex(int kind) { return 0; }
 }

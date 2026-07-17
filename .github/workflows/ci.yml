@@ -1,0 +1,22 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Compile runtime sources
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          find src -name '*.java' | sort > sources.txt
+          javac -encoding UTF-8 -d out @sources.txt

@@ -3,3 +3,4 @@ target
 lpgruntime.jar
 
 .idea
+.settings/

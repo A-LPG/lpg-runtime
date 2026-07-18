@@ -6,7 +6,7 @@ import java.util.HashMap;
 import java.util.IdentityHashMap;
 
 /**
- * Generalized LR driver over LPG backtrack/GLR conflict tables.
+ * Generalized LR driver over LPG backtrack/GLR conflict tables (GLR v2).
  * <p>
  * Conflict encoding matches {@link BacktrackingParser}: when
  * {@code tAction(state, kind) > ACCEPT_ACTION}, candidates are the
@@ -14,14 +14,11 @@ import java.util.IdentityHashMap;
  * Each candidate uses the same shift / reduce / shift-reduce classification
  * as {@link DeterministicParser}.
  * <p>
- * Token positions are absolute indices ({@link TokenStream#getNext}); the
- * shared stream cursor is not advanced during configuration forking. Equivalent
- * stacks are merged by state, grammar symbol, and token boundaries. ASTs for
- * the same grammar symbol and token-index span are canonicalized into a local
- * forest with {@link IAst#setNextAst}. This assumes generated or otherwise
- * side-effect-free AST-building {@link RuleAction}s; distinct non-AST semantic
- * values keep configurations separate. Cyclic / ε-loop grammars are rejected
- * via an iteration limit (GLR v1).
+ * Stacks are maintained as a graph-structured stack ({@link GssNode}/{@link GssEdge})
+ * with prefix sharing across forks; reductions populate a shared packed parse
+ * forest ({@link SppfNode}). Compatible {@link IAst#getNextAst()} forests are
+ * projected from SPPF symbol nodes for the same grammar symbol and token-index
+ * span. Cyclic / ε-loop grammars are rejected via an iteration limit.
  * <p>
  * Error repair ({@code max_error_count &gt; 0}) falls back to
  * {@link BacktrackingParser#fuzzyParseEntry} so {@code %Recover} prosthetic
@@ -53,16 +50,22 @@ public class GLRParser extends Stacks
     private Object[] frameParse;
     private HashMap<ReductionKey, IAst> familyCache;
     private HashMap<ForestKey, IAst> forestCache;
+    private HashMap<Long, GssNode> gssNodes;
+    private HashMap<Long, SppfNode> sppfNodes;
+    private SppfNode sppfRoot;
+    private int sppfSymbolCount;
 
     private static final class AcceptCandidate
     {
         final Object ast;
         final int grammarSymbol;
+        final SppfNode sppf;
 
-        AcceptCandidate(Object ast, int grammarSymbol)
+        AcceptCandidate(Object ast, int grammarSymbol, SppfNode sppf)
         {
             this.ast = ast;
             this.grammarSymbol = grammarSymbol;
+            this.sppf = sppf;
         }
     }
 
@@ -72,6 +75,8 @@ public class GLRParser extends Stacks
         int[] symbolStack;
         Object[] parseStack;
         int[] locationStack;
+        SppfNode[] sppfStack;
+        GssNode gssTip;
         int stateStackTop;
         int currentAction;
         int curtok;
@@ -86,12 +91,15 @@ public class GLRParser extends Stacks
             c.curtok = curtok;
             c.lastToken = lastToken;
             c.currentKind = currentKind;
+            c.gssTip = gssTip; // GSS prefix sharing across forks
             if (stateStack != null)
             {
                 c.stateStack = Arrays.copyOf(stateStack, stateStack.length);
                 c.symbolStack = Arrays.copyOf(symbolStack, symbolStack.length);
                 c.parseStack = Arrays.copyOf(parseStack, parseStack.length);
                 c.locationStack = Arrays.copyOf(locationStack, locationStack.length);
+                if (sppfStack != null)
+                    c.sppfStack = Arrays.copyOf(sppfStack, sppfStack.length);
             }
             return c;
         }
@@ -336,6 +344,18 @@ public class GLRParser extends Stacks
         throw new UnavailableParserInformationException();
     }
 
+    /** Root SPPF symbol node from the last successful error-free parse, or null. */
+    public SppfNode getSppfRoot()
+    {
+        return sppfRoot;
+    }
+
+    /** Number of distinct SPPF symbol nodes created in the last parse. */
+    public int getSppfSymbolCount()
+    {
+        return sppfSymbolCount;
+    }
+
     public void setMonitor(Monitor monitor) { this.monitor = monitor; }
 
     public void reset(Monitor monitor, TokenStream tokStream)
@@ -343,6 +363,8 @@ public class GLRParser extends Stacks
         this.monitor = monitor;
         this.tokStream = tokStream;
         taking_actions = false;
+        sppfRoot = null;
+        sppfSymbolCount = 0;
     }
 
     public void reset(TokenStream tokStream)
@@ -452,6 +474,9 @@ public class GLRParser extends Stacks
         tokStream.reset();
         familyCache = new HashMap<ReductionKey, IAst>();
         forestCache = new HashMap<ForestKey, IAst>();
+        gssNodes = new HashMap<Long, GssNode>();
+        sppfNodes = new HashMap<Long, SppfNode>();
+        sppfRoot = null;
         int firstTok = tokStream.getToken();
         int prev = tokStream.getPrevious(firstTok);
         int startTok = marker_kind == 0 ? firstTok : prev;
@@ -464,6 +489,7 @@ public class GLRParser extends Stacks
         start.curtok = startTok;
         start.lastToken = prev;
         start.currentKind = startKind;
+        start.gssTip = null;
         ensureCapacity(start, 16);
 
         ArrayList<Config> live = new ArrayList<Config>();
@@ -479,7 +505,7 @@ public class GLRParser extends Stacks
                 return null;
             if (--outerGuard < 0)
                 throw new RuntimeException(
-                    "cyclic/ε-loop grammar not supported by GLR v1");
+                    "cyclic/ε-loop grammar not supported by GLR v2");
 
             ArrayList<Config> next = new ArrayList<Config>();
             HashMap<ConfigKey, ArrayList<Config>> packed =
@@ -542,14 +568,18 @@ public class GLRParser extends Stacks
 
         Object root = accepts.get(0).ast;
         int rootSymbol = accepts.get(0).grammarSymbol;
+        sppfRoot = accepts.get(0).sppf;
         for (int i = 1; i < accepts.size(); i++)
         {
             AcceptCandidate other = accepts.get(i);
             if (other.grammarSymbol != rootSymbol)
                 throw new RuntimeException("GLR accepted distinct start symbols");
+            if (sppfRoot == null)
+                sppfRoot = other.sppf;
             if (!appendNextAst(root, other.ast))
                 throw new RuntimeException("overlapping GLR accept forests");
         }
+        sppfSymbolCount = sppfNodes.size();
         return root == NULL_RESULT ? null : root;
     }
 
@@ -563,15 +593,17 @@ public class GLRParser extends Stacks
         {
             if (--guard < 0)
                 throw new RuntimeException(
-                    "cyclic/ε-loop grammar not supported by GLR v1");
+                    "cyclic/ε-loop grammar not supported by GLR v2");
 
             Config c = work.remove(work.size() - 1);
             ensureCapacity(c, c.stateStackTop + 2);
             c.stateStack[++c.stateStackTop] = c.currentAction;
             c.locationStack[c.stateStackTop] = c.curtok;
             c.symbolStack[c.stateStackTop] = 0;
+            c.sppfStack[c.stateStackTop] = null;
             if (c.stateStackTop != parseStackRoot)
                 c.parseStack[c.stateStackTop] = null;
+            c.gssTip = gssPush(c.gssTip, c.currentAction, c.curtok, 0, null, null);
 
             // Classification order matches BacktrackingParser / DeterministicParser:
             // reduce, shift-reduce, shift, ERROR, conflict (ACCEPT < act < ERROR), ACCEPT.
@@ -600,11 +632,15 @@ public class GLRParser extends Stacks
         if (cand <= NUM_RULES)
         {
             fork.stateStackTop--;
+            fork.gssTip = gssPop(fork.gssTip);
             applyReduceClosure(fork, cand, work);
         }
         else if (cand > ERROR_ACTION)
         {
             fork.symbolStack[fork.stateStackTop] = fork.currentKind;
+            SppfNode term = terminalSppf(fork.currentKind, fork.curtok);
+            fork.sppfStack[fork.stateStackTop] = term;
+            fork.gssTip = gssRelabel(fork.gssTip, fork.currentKind, fork.curtok, null, term);
             fork.lastToken = fork.curtok;
             fork.curtok = tokStream.getNext(fork.curtok);
             fork.currentKind = tokStream.getKind(fork.curtok);
@@ -613,6 +649,9 @@ public class GLRParser extends Stacks
         else if (cand < ACCEPT_ACTION)
         {
             fork.symbolStack[fork.stateStackTop] = fork.currentKind;
+            SppfNode term = terminalSppf(fork.currentKind, fork.curtok);
+            fork.sppfStack[fork.stateStackTop] = term;
+            fork.gssTip = gssRelabel(fork.gssTip, fork.currentKind, fork.curtok, null, term);
             fork.lastToken = fork.curtok;
             fork.curtok = tokStream.getNext(fork.curtok);
             fork.currentKind = tokStream.getKind(fork.curtok);
@@ -627,7 +666,11 @@ public class GLRParser extends Stacks
                 root = fork.parseStack[parseStackRoot];
             if (fork.symbolStack != null && parseStackRoot <= fork.stateStackTop)
                 rootSymbol = fork.symbolStack[parseStackRoot];
-            accepts.add(new AcceptCandidate(root == null ? NULL_RESULT : root, rootSymbol));
+            SppfNode rootSppf = null;
+            if (fork.sppfStack != null && parseStackRoot < fork.sppfStack.length)
+                rootSppf = fork.sppfStack[parseStackRoot];
+            accepts.add(new AcceptCandidate(
+                root == null ? NULL_RESULT : root, rootSymbol, rootSppf));
         }
         // cand == ERROR_ACTION: drop fork
     }
@@ -641,7 +684,27 @@ public class GLRParser extends Stacks
             if (fork.stateStackTop - (rhs - 1) < 0)
                 throw new RuntimeException("GLR reduce stack underflow");
 
+            SppfNode[] kids = new SppfNode[rhs];
+            if (rhs > 0)
+            {
+                for (int i = 0; i < rhs; i++)
+                    kids[i] = fork.sppfStack[fork.stateStackTop - rhs + 1 + i];
+            }
             fork.stateStackTop -= (rhs - 1);
+            if (rhs > 0)
+            {
+                for (int i = 0; i < rhs - 1; i++)
+                    fork.gssTip = gssPop(fork.gssTip);
+            }
+            else
+            {
+                ensureCapacity(fork, fork.stateStackTop + 1);
+                fork.gssTip = gssPush(fork.gssTip,
+                    fork.stateStack[fork.stateStackTop],
+                    fork.locationStack[fork.stateStackTop],
+                    0, null, null);
+            }
+
             ReductionKey reductionKey =
                 new ReductionKey(action, fork.lastToken, rhs, fork.stateStackTop,
                                  fork.locationStack, fork.symbolStack, fork.parseStack);
@@ -683,8 +746,29 @@ public class GLRParser extends Stacks
                     familyCache.put(reductionKey, canonical);
                 }
                 fork.parseStack[fork.stateStackTop] = canonical;
+                result = canonical;
             }
+
+            int leftExt = fork.locationStack[fork.stateStackTop];
+            int rightExt = fork.lastToken;
+            if (result instanceof IAst)
+            {
+                IToken lt = ((IAst) result).getLeftIToken();
+                IToken rt = ((IAst) result).getRightIToken();
+                if (lt != null && rt != null)
+                {
+                    leftExt = lt.getTokenIndex();
+                    rightExt = rt.getTokenIndex();
+                }
+            }
+            SppfNode symNode = sppfSymbol(lhsSymbol, leftExt, rightExt);
+            addPacked(symNode, action, kids, result);
+            // result is already the v1-canonical nextAst forest when packable.
+            if (result instanceof IAst)
+                symNode.astForest = result;
+            fork.sppfStack[fork.stateStackTop] = symNode;
             fork.symbolStack[fork.stateStackTop] = lhsSymbol;
+            fork.gssTip = gssRelabel(fork.gssTip, lhsSymbol, leftExt, result, symNode);
             action = prs.ntAction(fork.stateStack[fork.stateStackTop], lhs);
         } while (action <= NUM_RULES);
 
@@ -704,6 +788,7 @@ public class GLRParser extends Stacks
             c.symbolStack = new int[neu];
             c.parseStack = new Object[neu];
             c.locationStack = new int[neu];
+            c.sppfStack = new SppfNode[neu];
         }
         else
         {
@@ -711,7 +796,94 @@ public class GLRParser extends Stacks
             c.symbolStack = Arrays.copyOf(c.symbolStack, neu);
             c.parseStack = Arrays.copyOf(c.parseStack, neu);
             c.locationStack = Arrays.copyOf(c.locationStack, neu);
+            c.sppfStack = Arrays.copyOf(c.sppfStack, neu);
         }
+    }
+
+    private static long sppfKey(int symbol, int left, int right)
+    {
+        long h = symbol;
+        h = 31 * h + left;
+        return 31 * h + right;
+    }
+
+    private SppfNode sppfSymbol(int grammarSymbol, int leftExtent, int rightExtent)
+    {
+        long key = sppfKey(grammarSymbol, leftExtent, rightExtent);
+        SppfNode n = sppfNodes.get(key);
+        if (n == null)
+        {
+            n = new SppfNode(grammarSymbol, leftExtent, rightExtent);
+            sppfNodes.put(key, n);
+        }
+        return n;
+    }
+
+    private SppfNode terminalSppf(int kind, int tok)
+    {
+        SppfNode term = sppfSymbol(kind, tok, tok);
+        if (term.packs.isEmpty())
+            term.packs.add(new SppfNode.Packed(-kind, null, null));
+        return term;
+    }
+
+    private void addPacked(SppfNode symNode, int rule, SppfNode[] children, Object semantic)
+    {
+        int n = children == null ? 0 : children.length;
+        for (int i = 0; i < symNode.packs.size(); i++)
+        {
+            SppfNode.Packed p = symNode.packs.get(i);
+            if (p.rule != rule || p.children.length != n)
+                continue;
+            boolean same = true;
+            for (int c = 0; c < n; c++)
+            {
+                if (p.children[c] != children[c])
+                {
+                    same = false;
+                    break;
+                }
+            }
+            if (same)
+                return;
+        }
+        symNode.packs.add(new SppfNode.Packed(rule, children, semantic));
+    }
+
+    private GssNode gssPush(GssNode tip, int state, int index,
+                            int symbol, Object semantic, SppfNode sppf)
+    {
+        GssNode n = new GssNode(state, index);
+        GssNode pred = tip == null ? new GssNode(Integer.MIN_VALUE, -1) : tip;
+        n.edges.add(new GssEdge(pred, symbol, index, semantic, sppf));
+        long key = (((long) state) << 32) ^ (index & 0xffffffffL);
+        GssNode canon = gssNodes.get(key);
+        if (canon == null)
+        {
+            canon = new GssNode(state, index);
+            gssNodes.put(key, canon);
+        }
+        canon.edges.add(new GssEdge(pred, symbol, index, semantic, sppf));
+        return n;
+    }
+
+    private static GssNode gssPop(GssNode tip)
+    {
+        if (tip == null || tip.edges.isEmpty())
+            return null;
+        GssNode pred = tip.edges.get(0).predecessor;
+        return pred.state == Integer.MIN_VALUE ? null : pred;
+    }
+
+    private static GssNode gssRelabel(GssNode tip, int symbol, int location,
+                                     Object semantic, SppfNode sppf)
+    {
+        if (tip == null || tip.edges.isEmpty())
+            return tip;
+        GssNode pred = tip.edges.get(0).predecessor;
+        GssNode n = new GssNode(tip.state, tip.index);
+        n.edges.add(new GssEdge(pred, symbol, location, semantic, sppf));
+        return n;
     }
 
     private void packAccept(ArrayList<AcceptCandidate> accepts, AcceptCandidate cand)
@@ -785,7 +957,33 @@ public class GLRParser extends Stacks
                 throw new RuntimeException("overlapping GLR semantic forests");
         }
         for (int i = 0; i <= existing.stateStackTop; i++)
+        {
             existing.parseStack[i] = packSym(existing.parseStack[i], incoming.parseStack[i]);
+            if (existing.sppfStack[i] == null)
+                existing.sppfStack[i] = incoming.sppfStack[i];
+            else if (incoming.sppfStack[i] != null
+                    && existing.sppfStack[i] != incoming.sppfStack[i]
+                    && existing.sppfStack[i].grammarSymbol
+                        == incoming.sppfStack[i].grammarSymbol
+                    && existing.sppfStack[i].leftExtent
+                        == incoming.sppfStack[i].leftExtent
+                    && existing.sppfStack[i].rightExtent
+                        == incoming.sppfStack[i].rightExtent)
+            {
+                SppfNode canon = existing.sppfStack[i];
+                SppfNode other = incoming.sppfStack[i];
+                for (int p = 0; p < other.packs.size(); p++)
+                {
+                    SppfNode.Packed pk = other.packs.get(p);
+                    addPacked(canon, pk.rule, pk.children, pk.semantic);
+                }
+                if (existing.parseStack[i] instanceof IAst)
+                    canon.astForest = existing.parseStack[i];
+            }
+        }
+        // Prefer longer GSS path registration from incoming when tips differ.
+        if (incoming.gssTip != null)
+            existing.gssTip = incoming.gssTip;
     }
 
     private Object packSym(Object a, Object b)

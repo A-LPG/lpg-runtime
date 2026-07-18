@@ -101,6 +101,12 @@ public interface ParseTable
     public boolean getBacktrack();
 
     //
+    // True when the table was generated with -glr (GLR conflict tables).
+    // Non-GLR tables omit the override; default is false.
+    //
+    default boolean isGLR() { return false; }
+
+    //
     // Map a nonterminal token kind (a symbol value with NT_OFFSET already
     // applied) to a compact index into the RuleAction.getProstheticAst() array.
     // Tables generated for grammars without %Recover symbols use this default,

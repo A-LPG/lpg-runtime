@@ -3,9 +3,10 @@ package lpg.runtime;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
+import java.util.IdentityHashMap;
 
 /**
- * Tomita-style GLR driver over LPG backtrack/GLR conflict tables.
+ * Generalized LR driver over LPG backtrack/GLR conflict tables.
  * <p>
  * Conflict encoding matches {@link BacktrackingParser}: when
  * {@code tAction(state, kind) > ACCEPT_ACTION}, candidates are the
@@ -14,15 +15,22 @@ import java.util.HashMap;
  * as {@link DeterministicParser}.
  * <p>
  * Token positions are absolute indices ({@link TokenStream#getNext}); the
- * shared stream cursor is not advanced during forking. Ambiguous results for
- * the same span are packed with {@link IAst#setNextAst}. Cyclic / ε-loop
- * grammars are rejected via an iteration limit (GLR v1).
+ * shared stream cursor is not advanced during configuration forking. Equivalent
+ * stacks are merged by state, grammar symbol, and token boundaries. ASTs for
+ * the same grammar symbol and token-index span are canonicalized into a local
+ * forest with {@link IAst#setNextAst}. This assumes generated or otherwise
+ * side-effect-free AST-building {@link RuleAction}s; distinct non-AST semantic
+ * values keep configurations separate. Cyclic / ε-loop grammars are rejected
+ * via an iteration limit (GLR v1).
  */
 public class GLRParser extends Stacks
 {
+    private static final Object NULL_RESULT = new Object();
+
     private Monitor monitor;
     private int START_STATE,
                 NUM_RULES,
+                NT_OFFSET,
                 LA_STATE_OFFSET,
                 ACCEPT_ACTION,
                 ERROR_ACTION;
@@ -34,13 +42,17 @@ public class GLRParser extends Stacks
     private boolean taking_actions = false;
     private int currentAction;
     private int lastToken;
+    private int parseStackRoot;
     private int frameTop;
     private int[] frameLocation;
     private Object[] frameParse;
+    private HashMap<ReductionKey, IAst> familyCache;
+    private HashMap<ForestKey, IAst> forestCache;
 
     private static final class Config
     {
         int[] stateStack;
+        int[] symbolStack;
         Object[] parseStack;
         int[] locationStack;
         int stateStackTop;
@@ -60,19 +72,159 @@ public class GLRParser extends Stacks
             if (stateStack != null)
             {
                 c.stateStack = Arrays.copyOf(stateStack, stateStack.length);
+                c.symbolStack = Arrays.copyOf(symbolStack, symbolStack.length);
                 c.parseStack = Arrays.copyOf(parseStack, parseStack.length);
                 c.locationStack = Arrays.copyOf(locationStack, locationStack.length);
             }
             return c;
         }
 
-        String key()
+        ConfigKey key()
         {
-            StringBuilder b = new StringBuilder();
-            b.append(curtok).append('|').append(currentAction).append('|');
-            for (int i = 0; i <= stateStackTop; i++)
-                b.append(stateStack[i]).append(',');
-            return b.toString();
+            return new ConfigKey(this);
+        }
+    }
+
+    private static final class ConfigKey
+    {
+        final Config config;
+        final int hash;
+
+        ConfigKey(Config config)
+        {
+            this.config = config;
+            int h = 31 * config.curtok + config.currentKind;
+            h = 31 * h + config.lastToken;
+            h = 31 * h + config.currentAction;
+            for (int i = 0; i <= config.stateStackTop; i++)
+            {
+                h = 31 * h + config.stateStack[i];
+                h = 31 * h + config.locationStack[i];
+                h = 31 * h + config.symbolStack[i];
+            }
+            hash = h;
+        }
+
+        @Override public int hashCode() { return hash; }
+
+        @Override public boolean equals(Object obj)
+        {
+            if (this == obj)
+                return true;
+            if (!(obj instanceof ConfigKey))
+                return false;
+            Config a = config;
+            Config b = ((ConfigKey) obj).config;
+            if (a.curtok != b.curtok || a.currentKind != b.currentKind
+                    || a.lastToken != b.lastToken
+                    || a.currentAction != b.currentAction
+                    || a.stateStackTop != b.stateStackTop)
+                return false;
+            for (int i = 0; i <= a.stateStackTop; i++)
+            {
+                if (a.stateStack[i] != b.stateStack[i]
+                        || a.locationStack[i] != b.locationStack[i]
+                        || a.symbolStack[i] != b.symbolStack[i])
+                    return false;
+            }
+            return true;
+        }
+    }
+
+    private static final class ReductionKey
+    {
+        final int rule;
+        final int lastToken;
+        final int[] locations;
+        final int[] grammarSymbols;
+        final Object[] semanticValues;
+        final int hash;
+
+        ReductionKey(int rule, int lastToken, int rhs, int frameTop,
+                     int[] locationStack, int[] symbolStack, Object[] parseStack)
+        {
+            this.rule = rule;
+            this.lastToken = lastToken;
+            locations = new int[rhs];
+            grammarSymbols = new int[rhs];
+            semanticValues = new Object[rhs];
+            int h = 31 * rule + lastToken;
+            for (int i = 0; i < rhs; i++)
+            {
+                int index = frameTop + i;
+                locations[i] = locationStack[index];
+                grammarSymbols[i] = symbolStack[index];
+                semanticValues[i] = parseStack[index];
+                h = 31 * h + locations[i];
+                h = 31 * h + grammarSymbols[i];
+                h = 31 * h + System.identityHashCode(semanticValues[i]);
+            }
+            hash = h;
+        }
+
+        @Override public int hashCode() { return hash; }
+
+        @Override public boolean equals(Object obj)
+        {
+            if (this == obj)
+                return true;
+            if (!(obj instanceof ReductionKey))
+                return false;
+            ReductionKey other = (ReductionKey) obj;
+            if (rule != other.rule || lastToken != other.lastToken
+                    || locations.length != other.locations.length)
+                return false;
+            for (int i = 0; i < locations.length; i++)
+            {
+                if (locations[i] != other.locations[i]
+                        || grammarSymbols[i] != other.grammarSymbols[i]
+                        || semanticValues[i] != other.semanticValues[i])
+                    return false;
+            }
+            return true;
+        }
+    }
+
+    private static final class ForestKey
+    {
+        final int grammarSymbol;
+        final ILexStream lexStream;
+        final int leftToken;
+        final int rightToken;
+
+        ForestKey(int grammarSymbol, IAst ast)
+        {
+            IToken left = ast.getLeftIToken();
+            IToken right = ast.getRightIToken();
+            this.grammarSymbol = grammarSymbol;
+            lexStream = left == null ? null : left.getILexStream();
+            leftToken = left == null ? -1 : left.getTokenIndex();
+            rightToken = right == null ? -1 : right.getTokenIndex();
+        }
+
+        boolean isPackable()
+        {
+            return leftToken >= 0 && rightToken >= 0;
+        }
+
+        @Override public int hashCode()
+        {
+            int h = 31 * grammarSymbol + System.identityHashCode(lexStream);
+            h = 31 * h + leftToken;
+            return 31 * h + rightToken;
+        }
+
+        @Override public boolean equals(Object obj)
+        {
+            if (this == obj)
+                return true;
+            if (!(obj instanceof ForestKey))
+                return false;
+            ForestKey other = (ForestKey) obj;
+            return grammarSymbol == other.grammarSymbol
+                && lexStream == other.lexStream
+                && leftToken == other.leftToken
+                && rightToken == other.rightToken;
         }
     }
 
@@ -190,6 +342,7 @@ public class GLRParser extends Stacks
 
         START_STATE = prs.getStartState();
         NUM_RULES = prs.getNumRules();
+        NT_OFFSET = prs.getNtOffset();
         LA_STATE_OFFSET = prs.getLaStateOffset();
         ACCEPT_ACTION = prs.getAcceptAction();
         ERROR_ACTION = prs.getErrorAction();
@@ -227,27 +380,28 @@ public class GLRParser extends Stacks
 
     public Object parseEntry(int marker_kind) throws BadParseException
     {
-        if (marker_kind != 0)
-            throw new BadParseException(0);
-
         tokStream.reset();
+        familyCache = new HashMap<ReductionKey, IAst>();
+        forestCache = new HashMap<ForestKey, IAst>();
         int firstTok = tokStream.getToken();
-        int firstKind = tokStream.getKind(firstTok);
         int prev = tokStream.getPrevious(firstTok);
+        int startTok = marker_kind == 0 ? firstTok : prev;
+        int startKind = marker_kind == 0 ? tokStream.getKind(firstTok) : marker_kind;
+        parseStackRoot = marker_kind == 0 ? 0 : 1;
 
         Config start = new Config();
         start.stateStackTop = -1;
         start.currentAction = START_STATE;
-        start.curtok = firstTok;
+        start.curtok = startTok;
         start.lastToken = prev;
-        start.currentKind = firstKind;
+        start.currentKind = startKind;
         ensureCapacity(start, 16);
 
         ArrayList<Config> live = new ArrayList<Config>();
         live.add(start);
 
         ArrayList<Object> accepts = new ArrayList<Object>();
-        int errorTok = firstTok;
+        int errorTok = startTok;
         int outerGuard = prs.getNumStates() * 64 + tokStream.getStreamLength() * 8 + 256;
 
         while (!live.isEmpty())
@@ -259,7 +413,8 @@ public class GLRParser extends Stacks
                     "cyclic/ε-loop grammar not supported by GLR v1");
 
             ArrayList<Config> next = new ArrayList<Config>();
-            HashMap<String, Config> packed = new HashMap<String, Config>();
+            HashMap<ConfigKey, ArrayList<Config>> packed =
+                new HashMap<ConfigKey, ArrayList<Config>>();
 
             for (Config cfg : live)
             {
@@ -275,15 +430,33 @@ public class GLRParser extends Stacks
 
                 for (Config r : stepResults)
                 {
-                    String k = r.key();
-                    Config existing = packed.get(k);
-                    if (existing == null)
+                    ConfigKey k = r.key();
+                    ArrayList<Config> bucket = packed.get(k);
+                    if (bucket == null)
                     {
-                        packed.put(k, r);
+                        bucket = new ArrayList<Config>();
+                        bucket.add(r);
+                        packed.put(k, bucket);
                         next.add(r);
                     }
                     else
-                        packParseStacks(existing, r);
+                    {
+                        boolean merged = false;
+                        for (Config existing : bucket)
+                        {
+                            if (canPackParseStacks(existing, r))
+                            {
+                                packParseStacks(existing, r);
+                                merged = true;
+                                break;
+                            }
+                        }
+                        if (!merged)
+                        {
+                            bucket.add(r);
+                            next.add(r);
+                        }
+                    }
                 }
             }
 
@@ -300,8 +473,11 @@ public class GLRParser extends Stacks
 
         Object root = accepts.get(0);
         for (int i = 1; i < accepts.size(); i++)
-            appendNextAst(root, accepts.get(i));
-        return root;
+        {
+            if (!appendNextAst(root, accepts.get(i)))
+                throw new RuntimeException("overlapping GLR accept forests");
+        }
+        return root == NULL_RESULT ? null : root;
     }
 
     private void stepConfig(Config cfg, ArrayList<Config> out, ArrayList<Object> accepts)
@@ -320,6 +496,9 @@ public class GLRParser extends Stacks
             ensureCapacity(c, c.stateStackTop + 2);
             c.stateStack[++c.stateStackTop] = c.currentAction;
             c.locationStack[c.stateStackTop] = c.curtok;
+            c.symbolStack[c.stateStackTop] = 0;
+            if (c.stateStackTop != parseStackRoot)
+                c.parseStack[c.stateStackTop] = null;
 
             // Classification order matches BacktrackingParser / DeterministicParser:
             // reduce, shift-reduce, shift, ERROR, conflict (ACCEPT < act < ERROR), ACCEPT.
@@ -352,6 +531,7 @@ public class GLRParser extends Stacks
         }
         else if (cand > ERROR_ACTION)
         {
+            fork.symbolStack[fork.stateStackTop] = fork.currentKind;
             fork.lastToken = fork.curtok;
             fork.curtok = tokStream.getNext(fork.curtok);
             fork.currentKind = tokStream.getKind(fork.curtok);
@@ -359,6 +539,7 @@ public class GLRParser extends Stacks
         }
         else if (cand < ACCEPT_ACTION)
         {
+            fork.symbolStack[fork.stateStackTop] = fork.currentKind;
             fork.lastToken = fork.curtok;
             fork.curtok = tokStream.getNext(fork.curtok);
             fork.currentKind = tokStream.getKind(fork.curtok);
@@ -368,15 +549,9 @@ public class GLRParser extends Stacks
         else if (cand == ACCEPT_ACTION)
         {
             Object root = null;
-            if (fork.parseStack != null)
-            {
-                if (fork.parseStack.length > 0 && fork.parseStack[0] != null)
-                    root = fork.parseStack[0];
-                else if (fork.stateStackTop >= 0)
-                    root = fork.parseStack[fork.stateStackTop];
-            }
-            if (root != null)
-                accepts.add(root);
+            if (fork.parseStack != null && parseStackRoot < fork.parseStack.length)
+                root = fork.parseStack[parseStackRoot];
+            accepts.add(root == null ? NULL_RESULT : root);
         }
         // cand == ERROR_ACTION: drop fork
     }
@@ -391,6 +566,9 @@ public class GLRParser extends Stacks
                 return;
 
             fork.stateStackTop -= (rhs - 1);
+            ReductionKey reductionKey =
+                new ReductionKey(action, fork.lastToken, rhs, fork.stateStackTop,
+                                 fork.locationStack, fork.symbolStack, fork.parseStack);
             this.currentAction = action;
             this.lastToken = fork.lastToken;
             this.frameTop = fork.stateStackTop;
@@ -408,6 +586,29 @@ public class GLRParser extends Stacks
             }
 
             int lhs = prs.lhs(action);
+            int lhsSymbol = NT_OFFSET + lhs;
+            Object result = fork.parseStack[fork.stateStackTop];
+            if (result instanceof IAst)
+            {
+                IAst canonical = familyCache.get(reductionKey);
+                if (canonical == null)
+                {
+                    IAst ast = (IAst) result;
+                    ForestKey forestKey = new ForestKey(lhsSymbol, ast);
+                    canonical = forestKey.isPackable() ? forestCache.get(forestKey) : null;
+                    if (canonical == null)
+                    {
+                        canonical = ast;
+                        if (forestKey.isPackable())
+                            forestCache.put(forestKey, canonical);
+                    }
+                    else if (canonical != ast && !appendNextAst(canonical, ast))
+                        throw new RuntimeException("cannot merge GLR production family");
+                    familyCache.put(reductionKey, canonical);
+                }
+                fork.parseStack[fork.stateStackTop] = canonical;
+            }
+            fork.symbolStack[fork.stateStackTop] = lhsSymbol;
             action = prs.ntAction(fork.stateStack[fork.stateStackTop], lhs);
         } while (action <= NUM_RULES);
 
@@ -424,12 +625,14 @@ public class GLRParser extends Stacks
         if (c.stateStack == null)
         {
             c.stateStack = new int[neu];
+            c.symbolStack = new int[neu];
             c.parseStack = new Object[neu];
             c.locationStack = new int[neu];
         }
         else
         {
             c.stateStack = Arrays.copyOf(c.stateStack, neu);
+            c.symbolStack = Arrays.copyOf(c.symbolStack, neu);
             c.parseStack = Arrays.copyOf(c.parseStack, neu);
             c.locationStack = Arrays.copyOf(c.locationStack, neu);
         }
@@ -437,23 +640,45 @@ public class GLRParser extends Stacks
 
     private void packAccept(ArrayList<Object> accepts, Object ast)
     {
+        if (ast == NULL_RESULT)
+        {
+            if (!accepts.contains(NULL_RESULT))
+                accepts.add(NULL_RESULT);
+            return;
+        }
         if (ast == null)
             return;
         for (Object a : accepts)
         {
-            if (sameSpan(a, ast))
+            if (sameSpan(a, ast) && appendNextAst(a, ast))
             {
-                appendNextAst(a, ast);
                 return;
             }
         }
         accepts.add(ast);
     }
 
+    private boolean canPackParseStacks(Config existing, Config incoming)
+    {
+        if (existing.stateStackTop != incoming.stateStackTop)
+            return false;
+        for (int i = 0; i <= existing.stateStackTop; i++)
+        {
+            Object a = existing.parseStack[i];
+            Object b = incoming.parseStack[i];
+            if (a == b)
+                continue;
+            if (!(a instanceof IAst) || !(b instanceof IAst))
+                return false;
+            if (!sameSpan(a, b))
+                return false;
+        }
+        return true;
+    }
+
     private void packParseStacks(Config existing, Config incoming)
     {
-        int i = existing.stateStackTop;
-        if (i >= 0 && i == incoming.stateStackTop)
+        for (int i = 0; i <= existing.stateStackTop; i++)
             existing.parseStack[i] = packSym(existing.parseStack[i], incoming.parseStack[i]);
     }
 
@@ -463,7 +688,8 @@ public class GLRParser extends Stacks
             return b;
         if (b == null || a == b)
             return a;
-        appendNextAst(a, b);
+        if (!appendNextAst(a, b))
+            throw new RuntimeException("overlapping GLR semantic forests");
         return a;
     }
 
@@ -476,25 +702,45 @@ public class GLRParser extends Stacks
         IToken lb = ib.getLeftIToken(), rb = ib.getRightIToken();
         if (la == null || ra == null || lb == null || rb == null)
             return false;
-        return la.getStartOffset() == lb.getStartOffset()
-            && ra.getEndOffset() == rb.getEndOffset();
+        return la.getILexStream() == lb.getILexStream()
+            && ra.getILexStream() == rb.getILexStream()
+            && la.getTokenIndex() == lb.getTokenIndex()
+            && ra.getTokenIndex() == rb.getTokenIndex();
     }
 
-    private static void appendNextAst(Object root, Object alt)
+    private static boolean appendNextAst(Object root, Object alt)
     {
         if (!(root instanceof IAst) || !(alt instanceof IAst))
-            return;
+            return false;
         IAst cur = (IAst) root;
         IAst neu = (IAst) alt;
+        if (cur == neu)
+            return true;
+
+        IdentityHashMap<IAst, Boolean> seen = new IdentityHashMap<IAst, Boolean>();
+        IAst tail = null;
         for (IAst p = cur; p != null; p = p.getNextAst())
         {
-            if (p == neu)
-                return;
-            if (p.getNextAst() == null)
-            {
-                p.setNextAst(neu);
-                return;
-            }
+            if (seen.put(p, Boolean.TRUE) != null)
+                return false;
+            tail = p;
         }
+
+        ArrayList<IAst> missing = new ArrayList<IAst>();
+        IdentityHashMap<IAst, Boolean> incoming = new IdentityHashMap<IAst, Boolean>();
+        for (IAst p = neu; p != null; p = p.getNextAst())
+        {
+            if (incoming.put(p, Boolean.TRUE) != null)
+                return false;
+            if (!seen.containsKey(p))
+                missing.add(p);
+        }
+        if (missing.isEmpty())
+            return true;
+
+        for (int i = 0; i < missing.size(); i++)
+            missing.get(i).setNextAst(i + 1 < missing.size() ? missing.get(i + 1) : null);
+        tail.setNextAst(missing.get(0));
+        return true;
     }
 }

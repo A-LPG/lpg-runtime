@@ -49,6 +49,18 @@ public class GLRParser extends Stacks
     private HashMap<ReductionKey, IAst> familyCache;
     private HashMap<ForestKey, IAst> forestCache;
 
+    private static final class AcceptCandidate
+    {
+        final Object ast;
+        final int grammarSymbol;
+
+        AcceptCandidate(Object ast, int grammarSymbol)
+        {
+            this.ast = ast;
+            this.grammarSymbol = grammarSymbol;
+        }
+    }
+
     private static final class Config
     {
         int[] stateStack;
@@ -400,7 +412,7 @@ public class GLRParser extends Stacks
         ArrayList<Config> live = new ArrayList<Config>();
         live.add(start);
 
-        ArrayList<Object> accepts = new ArrayList<Object>();
+        ArrayList<AcceptCandidate> accepts = new ArrayList<AcceptCandidate>();
         int errorTok = startTok;
         int outerGuard = prs.getNumStates() * 64 + tokStream.getStreamLength() * 8 + 256;
 
@@ -422,10 +434,10 @@ public class GLRParser extends Stacks
                     errorTok = cfg.curtok;
 
                 ArrayList<Config> stepResults = new ArrayList<Config>();
-                ArrayList<Object> stepAccepts = new ArrayList<Object>();
+                ArrayList<AcceptCandidate> stepAccepts = new ArrayList<AcceptCandidate>();
                 stepConfig(cfg, stepResults, stepAccepts);
 
-                for (Object a : stepAccepts)
+                for (AcceptCandidate a : stepAccepts)
                     packAccept(accepts, a);
 
                 for (Config r : stepResults)
@@ -471,16 +483,20 @@ public class GLRParser extends Stacks
         if (accepts.isEmpty())
             throw new BadParseException(errorTok);
 
-        Object root = accepts.get(0);
+        Object root = accepts.get(0).ast;
+        int rootSymbol = accepts.get(0).grammarSymbol;
         for (int i = 1; i < accepts.size(); i++)
         {
-            if (!appendNextAst(root, accepts.get(i)))
+            AcceptCandidate other = accepts.get(i);
+            if (other.grammarSymbol != rootSymbol)
+                throw new RuntimeException("GLR accepted distinct start symbols");
+            if (!appendNextAst(root, other.ast))
                 throw new RuntimeException("overlapping GLR accept forests");
         }
         return root == NULL_RESULT ? null : root;
     }
 
-    private void stepConfig(Config cfg, ArrayList<Config> out, ArrayList<Object> accepts)
+    private void stepConfig(Config cfg, ArrayList<Config> out, ArrayList<AcceptCandidate> accepts)
     {
         ArrayList<Config> work = new ArrayList<Config>();
         work.add(cfg.copy());
@@ -522,7 +538,7 @@ public class GLRParser extends Stacks
     private void applyConcreteAction(Config fork, int cand,
                                      ArrayList<Config> work,
                                      ArrayList<Config> out,
-                                     ArrayList<Object> accepts)
+                                     ArrayList<AcceptCandidate> accepts)
     {
         if (cand <= NUM_RULES)
         {
@@ -549,9 +565,12 @@ public class GLRParser extends Stacks
         else if (cand == ACCEPT_ACTION)
         {
             Object root = null;
+            int rootSymbol = 0;
             if (fork.parseStack != null && parseStackRoot < fork.parseStack.length)
                 root = fork.parseStack[parseStackRoot];
-            accepts.add(root == null ? NULL_RESULT : root);
+            if (fork.symbolStack != null && parseStackRoot <= fork.stateStackTop)
+                rootSymbol = fork.symbolStack[parseStackRoot];
+            accepts.add(new AcceptCandidate(root == null ? NULL_RESULT : root, rootSymbol));
         }
         // cand == ERROR_ACTION: drop fork
     }
@@ -563,7 +582,7 @@ public class GLRParser extends Stacks
         {
             int rhs = prs.rhs(action);
             if (fork.stateStackTop - (rhs - 1) < 0)
-                return;
+                throw new RuntimeException("GLR reduce stack underflow");
 
             fork.stateStackTop -= (rhs - 1);
             ReductionKey reductionKey =
@@ -638,24 +657,36 @@ public class GLRParser extends Stacks
         }
     }
 
-    private void packAccept(ArrayList<Object> accepts, Object ast)
+    private void packAccept(ArrayList<AcceptCandidate> accepts, AcceptCandidate cand)
     {
+        Object ast = cand.ast;
+        int grammarSymbol = cand.grammarSymbol;
         if (ast == NULL_RESULT)
         {
-            if (!accepts.contains(NULL_RESULT))
-                accepts.add(NULL_RESULT);
+            for (int i = 0; i < accepts.size(); i++)
+            {
+                if (accepts.get(i).ast == NULL_RESULT)
+                    return;
+            }
+            accepts.add(cand);
             return;
         }
         if (ast == null)
             return;
-        for (Object a : accepts)
+        for (int i = 0; i < accepts.size(); i++)
         {
-            if (sameSpan(a, ast) && appendNextAst(a, ast))
+            AcceptCandidate existing = accepts.get(i);
+            Object a = existing.ast;
+            if (a == NULL_RESULT)
+                continue;
+            if (existing.grammarSymbol == grammarSymbol
+                && sameSpan(a, ast)
+                && appendNextAst(a, ast))
             {
                 return;
             }
         }
-        accepts.add(ast);
+        accepts.add(cand);
     }
 
     private boolean canPackParseStacks(Config existing, Config incoming)
@@ -672,12 +703,30 @@ public class GLRParser extends Stacks
                 return false;
             if (!sameSpan(a, b))
                 return false;
+            if (!canAppendNextAst(a, b))
+                return false;
         }
         return true;
     }
 
+    /** Dry-run of {@link #appendNextAst}: true if forests can merge without cycle. */
+    private static boolean canAppendNextAst(Object root, Object alt)
+    {
+        return appendNextAst(root, alt, false);
+    }
+
     private void packParseStacks(Config existing, Config incoming)
     {
+        // Re-check before mutating so a mid-pack failure cannot leave a partial forest.
+        for (int i = 0; i <= existing.stateStackTop; i++)
+        {
+            Object a = existing.parseStack[i];
+            Object b = incoming.parseStack[i];
+            if (a == b || a == null || b == null)
+                continue;
+            if (!canAppendNextAst(a, b))
+                throw new RuntimeException("overlapping GLR semantic forests");
+        }
         for (int i = 0; i <= existing.stateStackTop; i++)
             existing.parseStack[i] = packSym(existing.parseStack[i], incoming.parseStack[i]);
     }
@@ -710,6 +759,17 @@ public class GLRParser extends Stacks
 
     private static boolean appendNextAst(Object root, Object alt)
     {
+        return appendNextAst(root, alt, true);
+    }
+
+    /**
+     * Link {@code alt}'s nextAst alternatives onto {@code root}.
+     * Only mutates the existing chain's tail ({@code setNextAst} on a node
+     * already in {@code root}); never rewrites nextAst links that belong to
+     * the incoming alternative forest.
+     */
+    private static boolean appendNextAst(Object root, Object alt, boolean commit)
+    {
         if (!(root instanceof IAst) || !(alt instanceof IAst))
             return false;
         IAst cur = (IAst) root;
@@ -726,21 +786,36 @@ public class GLRParser extends Stacks
             tail = p;
         }
 
-        ArrayList<IAst> missing = new ArrayList<IAst>();
         IdentityHashMap<IAst, Boolean> incoming = new IdentityHashMap<IAst, Boolean>();
-        for (IAst p = neu; p != null; p = p.getNextAst())
+        for (IAst p = neu; p != null; )
         {
             if (incoming.put(p, Boolean.TRUE) != null)
                 return false;
-            if (!seen.containsKey(p))
-                missing.add(p);
-        }
-        if (missing.isEmpty())
+            if (seen.containsKey(p))
+            {
+                p = p.getNextAst();
+                continue;
+            }
+            // Refuse attachments whose existing nextAst would re-enter the
+            // root forest (cycle). Never rewrite incoming links to work around it.
+            for (IAst q = p.getNextAst(); q != null; q = q.getNextAst())
+            {
+                if (incoming.put(q, Boolean.TRUE) != null)
+                    return false;
+                if (seen.containsKey(q))
+                    return false;
+            }
+            if (commit)
+            {
+                tail.setNextAst(p);
+                for (IAst q = p; q != null; q = q.getNextAst())
+                {
+                    seen.put(q, Boolean.TRUE);
+                    tail = q;
+                }
+            }
             return true;
-
-        for (int i = 0; i < missing.size(); i++)
-            missing.get(i).setNextAst(i + 1 < missing.size() ? missing.get(i + 1) : null);
-        tail.setNextAst(missing.get(0));
+        }
         return true;
     }
 }

@@ -22,6 +22,11 @@ import java.util.IdentityHashMap;
  * side-effect-free AST-building {@link RuleAction}s; distinct non-AST semantic
  * values keep configurations separate. Cyclic / ε-loop grammars are rejected
  * via an iteration limit (GLR v1).
+ * <p>
+ * Error repair ({@code max_error_count &gt; 0}) falls back to
+ * {@link BacktrackingParser#fuzzyParseEntry} so {@code %Recover} prosthetic
+ * AST replay matches the backtracking driver. Repair returns a single tree;
+ * ambiguity forests apply only on successful error-free GLR parses.
  */
 public class GLRParser extends Stacks
 {
@@ -390,7 +395,59 @@ public class GLRParser extends Stacks
         return parseEntry(0);
     }
 
+    /**
+     * Parse with optional error repair. When {@code max_error_count &gt; 0} and
+     * the GLR drive fails, falls back to {@link BacktrackingParser#fuzzyParse}
+     * (RecoveryParser + {@code %Recover} prosthesis).
+     */
+    public Object parse(int max_error_count) throws BadParseException
+    {
+        return parseEntry(0, max_error_count);
+    }
+
+    /** Error-free GLR parse (no repair). */
     public Object parseEntry(int marker_kind) throws BadParseException
+    {
+        return parseEntryNoRepair(marker_kind);
+    }
+
+    /**
+     * GLR parse; on {@link BadParseException} with {@code max_error_count &gt; 0},
+     * recover via backtracking {@code fuzzyParseEntry} (single tree).
+     */
+    public Object parseEntry(int marker_kind, int max_error_count) throws BadParseException
+    {
+        try
+        {
+            return parseEntryNoRepair(marker_kind);
+        }
+        catch (BadParseException e)
+        {
+            if (max_error_count <= 0)
+                throw e;
+            try
+            {
+                BacktrackingParser bt =
+                    new BacktrackingParser(monitor, tokStream, prs, ra);
+                ra.setRecoverParser(bt);
+                try
+                {
+                    return bt.fuzzyParseEntry(marker_kind, max_error_count);
+                }
+                finally
+                {
+                    ra.setRecoverParser(null);
+                }
+            }
+            catch (BadParseSymFileException | NotBacktrackParseTableException ex)
+            {
+                // GLR tables force backtrack encoding; these should not fire.
+                throw new RuntimeException(ex);
+            }
+        }
+    }
+
+    private Object parseEntryNoRepair(int marker_kind) throws BadParseException
     {
         tokStream.reset();
         familyCache = new HashMap<ReductionKey, IAst>();

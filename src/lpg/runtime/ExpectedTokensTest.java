@@ -80,12 +80,16 @@ public final class ExpectedTokensTest
         if (!names.equals(Arrays.asList("a", "b")))
             System.exit(1);
 
-        ParseIssue issue = ParseIssue.mismatch(prs, 0, ParseErrorCodes.ERROR_CODE,
+        // Use literal ERROR_CODE (=1) to keep this smoke test free of Messages.properties.
+        final int errorCode = 1;
+        ParseIssue issue = ParseIssue.mismatch(prs, 0, errorCode,
                 new SourceSpan(1, 1), "x");
-        if (issue.code != ParseErrorCodes.ERROR_CODE
+        if (issue.code != errorCode
                 || issue.span.startOffset != 1
                 || !issue.expected.equals(Arrays.asList("a", "b"))
                 || !"x".equals(issue.got))
             System.exit(2);
+
+        System.out.println("ExpectedTokensTest OK");
     }
 }
